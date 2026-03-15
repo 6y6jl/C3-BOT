@@ -1,83 +1,121 @@
 #include "Arduino.h"
 #include "config_handler.h"
-#include "pc_control.h"
 #include "bot_logic.h"
+#include "mochi_robot.h"
 
-#define RESET_PIN 2
-
-void checkResetButton() {
-    // Для TTP223 нажатие — это HIGH (1)
-    if (digitalRead(RESET_PIN) == HIGH) {
-        unsigned long startPress = millis();
-        Serial.println("\n[ВНИМАНИЕ] Сенсор зажат! Держите 3 сек для сброса...");
-        
-        while (digitalRead(RESET_PIN) == HIGH) {
-            if (millis() - startPress >= 3000) {
-                Serial.println("[СБРОС] Очистка памяти и Wi-Fi...");
-                WiFiManager wm;
-                wm.resetSettings(); 
-                LittleFS.format();   
-                Serial.println("Готово! Перезагрузка...");
-                delay(1000);
-                ESP.restart();
-            }
-            delay(10); 
-        }
-        Serial.println("[ОТМЕНА] Сенсор отпущен слишком рано.");
-    }
-}
+MochiRobot mochi;
+bool wifiConnected = false;
 
 void setup() {
     Serial.begin(115200);
-    setupHardware();
+    delay(1000);
+    
+    Serial.println("\n\n=== MOCHI ROBOT PC CONTROLLER ===");
+    
+    // Инициализация робота
+    if (!mochi.begin()) {
+        Serial.println("OLED не найден!");
+    } else {
+        mochi.showWelcome();
+    }
+    
+    // Загрузка конфигурации
     loadConfig();
-
-    pinMode(RESET_PIN, INPUT); // Важно для TTP223
-
+    
+    // Пытаемся подключиться к WiFi
+    mochi.showMessage("Connecting...", "to WiFi");
+    
     WiFiManager wm;
     wm.setSaveConfigCallback(saveConfigCallback);
-    wm.setConfigPortalTimeout(180); 
-
+    wm.setConfigPortalTimeout(180);
+    
     WiFiManagerParameter p_token("t", "Telegram Token", bot_token, 50);
     WiFiManagerParameter p_id("i", "Your Chat ID", chat_id, 20);
     wm.addParameter(&p_token);
     wm.addParameter(&p_id);
-
-    // Подключаемся к WiFi
-    if (!wm.autoConnect("ESP32_PC_CONTROLLER")) {
-        Serial.println("Таймаут настройки. Рестарт...");
-        delay(3000);
-        ESP.restart();
-    }
-
-    // Принудительно закрываем точку доступа
-    WiFi.softAPdisconnect(true); 
-    WiFi.mode(WIFI_STA); 
-
-    // Сохранение данных из веб-интерфейса
-    if (shouldSaveConfig) {
-        strncpy(bot_token, p_token.getValue(), 50);
-        strncpy(chat_id, p_id.getValue(), 20);
-        saveConfig();
-        Serial.println("Настройки сохранены.");
-    }
-
-    // Отладка: проверяем, что в памяти
-    Serial.print("Текущий токен: "); Serial.println(bot_token);
-    Serial.print("Текущий ID: "); Serial.println(chat_id);
-
-    // Инициализация бота
-    bot.setToken(bot_token);
-    bot.attach(handleMessages);
     
-    if (strlen(chat_id) > 1) {
-        bot.sendMessage("⚡ Система управления запущена", chat_id);
+    if (wm.autoConnect("MOCHI_ROBOT")) {
+        wifiConnected = true;
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        
+        mochi.showWiFiStatus(WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+        mochi.onWiFiSuccess();
+        
+        if (shouldSaveConfig) {
+            strncpy(bot_token, p_token.getValue(), 50);
+            strncpy(chat_id, p_id.getValue(), 20);
+            saveConfig();
+            mochi.showMessage("Config Saved!", "Token & ID");
+            delay(1000);
+        }
+        
+        bot.setToken(bot_token);
+        bot.attach(handleMessages);
+        
+        if (strlen(chat_id) > 1) {
+            bot.sendMessage("🤖 MOCHI ROBOT запущен!\nСтатус ПК контроллера онлайн", chat_id);
+        }
+        
+        mochi.showMessage("MOCHI Ready!", "Online");
+        
+    } else {
+        wifiConnected = false;
+        
+        mochi.showMessage("⚠️ WiFi Failed!", "AP Mode Active");
+        mochi.onWiFiFail();
+        delay(2000);
+        
+        mochi.showMessage("Connect to AP:", "MOCHI_ROBOT");
+        delay(2000);
+        
+        mochi.showMessage("Configure at:", "192.168.4.1");
+        // Заменяем MOOD_SURPRISED на MOOD_EXCITED
+        mochi.setMood(MOOD_EXCITED);
+        
+        Serial.println("WiFi Failed! AP Mode: MOCHI_ROBOT");
+        Serial.println("Connect and visit 192.168.4.1 to configure");
     }
     
-    Serial.println("Система онлайн!");
+    Serial.println("MOCHI ROBOT запущен!");
 }
 
 void loop() {
-    bot.tick();
-    checkResetButton();
+    // Проверка WiFi статуса
+    if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+        wifiConnected = false;
+        mochi.onWiFiFail();
+        mochi.showMessage("⚠️ WiFi Lost!", "Check connection");
+    } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+        wifiConnected = true;
+        mochi.onWiFiSuccess();
+        mochi.showWiFiStatus(WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    }
+    
+    // Логика бота
+    if (wifiConnected) {
+        bot.tick();
+    }
+    
+    // Обновление лица (автоматические движения)
+    mochi.update();
+    
+    // Проверка сенсорной кнопки с измерением длительности
+    static unsigned long pressStart = 0;
+    static bool buttonPressed = false;
+    
+    if (digitalRead(TOUCH_PIN) == HIGH && !buttonPressed) {
+        buttonPressed = true;
+        pressStart = millis();
+    }
+    
+    if (digitalRead(TOUCH_PIN) == LOW && buttonPressed) {
+        buttonPressed = false;
+        unsigned long pressDuration = millis() - pressStart;
+        
+        // Передаем длительность нажатия в робота (вместо nextMood)
+        mochi.handleTouch(pressDuration);
+        
+        delay(200); // Антидребезг
+    }
 }
